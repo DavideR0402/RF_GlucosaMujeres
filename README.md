@@ -33,8 +33,8 @@ Sigue estos pasos para poner en marcha el proyecto en tu entorno local.
 ### 2. Clonar el Repositorio
 
 ```bash
-git clone https://github.com/tu-usuario/tu-repositorio.git
-cd tu-repositorio
+git https://github.com/DavideR0402/RF_GlucosaMujeres.git
+cd RF_GlucosaMujeres
 ```
 
 
