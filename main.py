@@ -1,5 +1,5 @@
 # main.py
-from fastapi import FastAPI, HTTPException, Security
+from fastapi import FastAPI, HTTPException, Security, Body
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field, field_validator
 from typing import Optional, Dict, List, Any
@@ -19,6 +19,8 @@ api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=True)
 
 MODEL_PATH = os.getenv("MODEL_PATH", "modelo_gradient_boosting_2.joblib")
 API_KEY = os.getenv("API_KEY")
+
+MISSING_TOKEN = "__MISSING__"
 
 # ---- Globales (se rellenan en startup) --------------------------------------
 pipe = None
@@ -72,15 +74,22 @@ def safe_isna(v: Any) -> bool:
     return False
 
 def align_row(payload: Dict) -> pd.DataFrame:
+    """
+    Alinea dict a FEATURE_COLS, sanea tipos (ManyChat) y
+    garantiza que las categóricas sean strings, usando __MISSING__ si falta.
+    """
     global FEATURE_COLS, num_cols, cat_cols
+
     clean = {k: sanitize_value(v) for k, v in payload.items()}
     cols = FEATURE_COLS or list(clean.keys())
     row = {c: np.nan for c in cols}
 
+    # Copiar valores saneados
     for k, v in clean.items():
         if k in row:
             row[k] = v
 
+    # IMC si corresponde
     if "imc" in cols and ("peso" in clean or "talla" in clean):
         imc_val = compute_imc(clean.get("peso"), clean.get("talla"))
         if imc_val is not None:
@@ -88,13 +97,15 @@ def align_row(payload: Dict) -> pd.DataFrame:
 
     df = pd.DataFrame([row])
 
+    # Numéricas → número
     for c in num_cols:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
+    # Categóricas → string o __MISSING__
     for c in cat_cols:
         if c in df.columns:
-            df[c] = df[c].map(lambda x: x if safe_isna(x) else str(x))
+            df[c] = df[c].map(lambda x: MISSING_TOKEN if safe_isna(x) else str(x))
 
     return df
 
@@ -111,6 +122,52 @@ app = FastAPI(title="API Glucosa RF", version="1.0")
 def root():
     return {"ok": True, "service": "API Glucosa RF", "docs": "/docs", "health": "/health"}
 
+def _iter_estimators(est):
+    """Itera recursivamente sobre ColumnTransformer/Pipeline para localizar OneHotEncoder."""
+    from sklearn.pipeline import Pipeline
+    from sklearn.compose import ColumnTransformer
+    if isinstance(est, Pipeline):
+        for name, step in est.steps:
+            yield from _iter_estimators(step)
+    elif isinstance(est, ColumnTransformer):
+        for name, trans, cols in est.transformers_:
+            if trans == "drop" or trans == "passthrough":
+                continue
+            yield from _iter_estimators(trans)
+    else:
+        yield est
+
+def _patch_onehot_categories():
+    """Limpia categories_ de cada OneHotEncoder para evitar np.isnan sobre objetos."""
+    try:
+        from sklearn.preprocessing import OneHotEncoder
+    except Exception:
+        return
+    count = 0
+    for est in _iter_estimators(pipe):
+        if isinstance(est, OneHotEncoder) and hasattr(est, "categories_"):
+            new_cats = []
+            for cats in est.categories_:
+                # quitar NaN/None y convertir a string
+                cleaned = []
+                for v in list(cats):
+                    if v is None:
+                        continue
+                    if isinstance(v, float) and math.isnan(v):
+                        continue
+                    cleaned.append(str(v))
+                if MISSING_TOKEN not in cleaned:
+                    cleaned.append(MISSING_TOKEN)
+                new_cats.append(np.array(cleaned, dtype=object))
+            est.categories_ = new_cats
+            # Ignorar categorías desconocidas en inferencia
+            try:
+                est.handle_unknown = "ignore"
+            except Exception:
+                pass
+            count += 1
+    logger.info(f"Parcheados {count} OneHotEncoder(s) categories_ (añadido {MISSING_TOKEN}).")
+
 @app.on_event("startup")
 def load_artifacts():
     from sklearn.compose import ColumnTransformer
@@ -126,13 +183,14 @@ def load_artifacts():
         logger.error(f"No se pudo cargar el modelo en {MODEL_PATH}: {e}", exc_info=True)
         raise
 
+    # Extraer columnas del ColumnTransformer si existe
+    pre = None
     try:
         ns = list(getattr(pipe, "named_steps", {}).keys())
         logger.info(f"named_steps: {ns}")
     except Exception:
         pass
 
-    pre = None
     if hasattr(pipe, "named_steps"):
         pre = pipe.named_steps.get("preprocess") or pipe.named_steps.get("preprocessor")
 
@@ -154,13 +212,6 @@ def load_artifacts():
             num_cols = ncols
             cat_cols = ccols
             FEATURE_COLS = ncols + ccols
-
-            try:
-                fnames = list(pre.get_feature_names_out())
-                logger.info(f"pre.get_feature_names_out(): {len(fnames)} columnas transformadas")
-            except Exception:
-                pass
-
             logger.info(f"num_cols={len(num_cols)} cat_cols={len(cat_cols)} FEATURES={len(FEATURE_COLS)}")
         except Exception as e:
             logger.warning(f"No se pudieron derivar columnas desde ColumnTransformer: {e}")
@@ -173,7 +224,10 @@ def load_artifacts():
         else:
             logger.warning("No se pudieron determinar FEATURE_COLS; se usarán keys del payload en cada request.")
 
-# ---- Schemas -----------------------------------------------------------------
+    # Parchear OHE para evitar isnan sobre objetos
+    _patch_onehot_categories()
+
+# ---- Schemas (solo para /predict_typed) -------------------------------------
 class PredictItem(BaseModel):
     edad: Optional[float] = Field(None, ge=0)
     tas: Optional[float] = None
@@ -204,11 +258,12 @@ def health():
         "tiene_named_steps": bool(getattr(pipe, "named_steps", {})),
     }
 
+# Tolerante (recomendado para ManyChat)
 @app.post("/predict", dependencies=[Security(get_api_key)])
-def predict(item: PredictItem):
+def predict(payload: Dict[str, Any] = Body(...)):
     global pipe
     try:
-        df_one = align_row(item.model_dump())
+        df_one = align_row(payload)
         y_pred = float(pipe.predict(df_one)[0])
         return {
             "pred_glucosa_mg_dl": round(y_pred, 2),
@@ -221,3 +276,8 @@ def predict(item: PredictItem):
     except Exception as e:
         logger.error(f"Error en /predict: {e}", exc_info=True)
         raise HTTPException(status_code=400, detail=str(e))
+
+# Estricto (útil para pruebas manuales)
+@app.post("/predict_typed", dependencies=[Security(get_api_key)])
+def predict_typed(item: PredictItem):
+    return predict(item.model_dump())
