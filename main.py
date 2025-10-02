@@ -2,13 +2,12 @@
 from fastapi import FastAPI, HTTPException, Security
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field, field_validator
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Any
 import os
 import logging
 import joblib
 import numpy as np
 import pandas as pd
-from typing import Any
 import math
 
 # ---- Config / Logging --------------------------------------------------------
@@ -28,60 +27,107 @@ cat_cols: List[str] = []
 FEATURE_COLS: List[str] = []
 
 # ---- Utils ------------------------------------------------------------------
-def compute_imc(peso: Optional[float], talla: Optional[float]) -> Optional[float]:
-    if peso is None or talla is None:
+def to_float_or_none(v: Any) -> Optional[float]:
+    if v is None or isinstance(v, bool):
         return None
     try:
-        t_m = talla / 100.0 if talla > 3 else talla  # si parece cm, pasar a metros
-        if t_m and t_m > 0 and peso > 0:
-            return round(peso / (t_m**2), 2)
+        return float(v)
+    except Exception:
+        return None
+
+def compute_imc(peso: Any, talla: Any) -> Optional[float]:
+    """ Calcula IMC tolerante a strings/listas; talla en m o cm. """
+    p = to_float_or_none(peso)
+    t = to_float_or_none(talla)
+    if p is None or t is None:
+        return None
+    try:
+        t_m = t / 100.0 if t > 3 else t  # si parece cm, pasar a metros
+        if t_m and t_m > 0 and p > 0:
+            return round(p / (t_m ** 2), 2)
     except (TypeError, ZeroDivisionError) as e:
         logger.warning(f"No se pudo calcular IMC con peso={peso}, talla={talla}. Error: {e}")
     return None
 
+def sanitize_value(v: Any):
+    """
+    Convierte valores del payload a escalares seguros para pandas/sklearn.
+    - list -> primer elemento (recursivo)
+    - dict -> None (o serializa si quieres)
+    - strings 'null'/'none'/'nan'/'' -> None
+    """
+    if isinstance(v, list):
+        return sanitize_value(v[0]) if v else None
+    if isinstance(v, dict):
+        return None  # si prefieres conservarlo: json.dumps(v)
+    if isinstance(v, str):
+        s = v.strip()
+        if s.lower() in {"", "null", "none", "nan"}:
+            return None
+        return s
+    return v
+
+def safe_isna(v: Any) -> bool:
+    """
+    Alternativa segura a pd.isna que evita llamar isnan sobre no-numéricos.
+    """
+    if v is None:
+        return True
+    if isinstance(v, bool):
+        return False
+    if isinstance(v, (int, float, np.floating, np.integer)):
+        return isinstance(v, float) and math.isnan(v)
+    if isinstance(v, str):
+        return False
+    return False
 
 def align_row(payload: Dict) -> pd.DataFrame:
     """
     Alinea dict a FEATURE_COLS y calcula IMC si 'imc' existe en las features.
+    Sanea valores provenientes de ManyChat (listas/dicts/strings).
     """
-    global FEATURE_COLS, num_cols
+    global FEATURE_COLS, num_cols, cat_cols
 
-    # Si por alguna razón no tenemos FEATURES (p.ej. modelo sin metadatos),
-    # tomamos las claves del payload como último recurso.
-    cols = FEATURE_COLS or list(payload.keys())
+    # Saneo previo del payload
+    clean = {k: sanitize_value(v) for k, v in payload.items()}
 
+    # Si no tenemos FEATURES (modelo sin metadatos), usa las claves del payload
+    cols = FEATURE_COLS or list(clean.keys())
     row = {c: np.nan for c in cols}
-    for k, v in payload.items():
+
+    # Copiar valores saneados que sí estén en el esquema
+    for k, v in clean.items():
         if k in row:
             row[k] = v
 
     # Calcular IMC si corresponde
-    if "imc" in cols and ("peso" in payload or "talla" in payload):
-        imc_val = compute_imc(payload.get("peso"), payload.get("talla"))
+    if "imc" in cols and ("peso" in clean or "talla" in clean):
+        imc_val = compute_imc(clean.get("peso"), clean.get("talla"))
         if imc_val is not None:
             row["imc"] = imc_val
 
     df = pd.DataFrame([row])
 
-    # Coerción numérica para num_cols conocidas
+    # Coerción numérica de columnas numéricas conocidas
     for c in num_cols:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    return df
+    # Normalización de categóricas a string sin romper NaN
+    for c in cat_cols:
+        if c in df.columns:
+            df[c] = df[c].map(lambda x: x if safe_isna(x) else str(x))
 
+    return df
 
 # ---- Seguridad ---------------------------------------------------------------
 async def get_api_key(incoming_key: str = Security(api_key_header)):
     if API_KEY and incoming_key == API_KEY:
         return incoming_key
-    # Si no configuraste API_KEY en Render, siempre fallará:
     raise HTTPException(status_code=403, detail="Could not validate credentials")
-
 
 # ---- App ---------------------------------------------------------------------
 app = FastAPI(title="API Glucosa RF", version="1.0")
-
 
 @app.on_event("startup")
 def load_artifacts():
@@ -122,7 +168,6 @@ def load_artifacts():
     # 3) Extraer columnas si tenemos ColumnTransformer
     if pre is not None:
         try:
-            # Caso clásico: transformers_ con ('num', transformer, cols) y ('cat', transformer, cols)
             ncols, ccols = [], []
             for name, transformer, cols in pre.transformers_:
                 if name == "num":
@@ -133,7 +178,6 @@ def load_artifacts():
             cat_cols = ccols
             FEATURE_COLS = ncols + ccols
 
-            # Si el transformer expone nombres expandidos:
             try:
                 fnames = list(pre.get_feature_names_out())
                 logger.info(f"pre.get_feature_names_out(): {len(fnames)} columnas transformadas")
@@ -153,7 +197,6 @@ def load_artifacts():
         else:
             logger.warning("No se pudieron determinar FEATURE_COLS; se usarán keys del payload en cada request.")
 
-
 # ---- Schemas -----------------------------------------------------------------
 class PredictItem(BaseModel):
     edad: Optional[float] = Field(None, ge=0)
@@ -168,14 +211,13 @@ class PredictItem(BaseModel):
     ips_codigo: Optional[float] = None
 
     class Config:
-        extra = "allow"
+        extra = "allow"  # en Pydantic v2 puedes usar: model_config = ConfigDict(extra="allow")
 
     @field_validator("talla")
     def talla_valida(cls, v):
         if v is not None and v <= 0:
             raise ValueError("talla debe ser > 0")
         return v
-
 
 # ---- Endpoints ---------------------------------------------------------------
 @app.get("/health")
@@ -185,26 +227,6 @@ def health():
         "features_esperadas": len(FEATURE_COLS),
         "tiene_named_steps": bool(getattr(pipe, "named_steps", {})),
     }
-
-def safe_isna(v: Any) -> bool:
-    """
-    Alternativa segura a pd.isna que evita llamar isnan sobre no-numéricos.
-    """
-    if v is None:
-        return True
-    # bool debe tratarse como escalar no-missing
-    if isinstance(v, bool):
-        return False
-    # numéricos
-    if isinstance(v, (int, float, np.floating, np.integer)):
-        # math.isnan solo admite float; protege ints
-        return isinstance(v, float) and math.isnan(v)
-    # strings: nunca los consideramos NaN (ya tratamos 'null' arriba)
-    if isinstance(v, str):
-        return False
-    # Cualquier estructura no escalar (list/dict/etc.) -> no missing
-    return False
-
 
 @app.post("/predict", dependencies=[Security(get_api_key)])
 def predict(item: PredictItem):
@@ -227,4 +249,3 @@ def predict(item: PredictItem):
     except Exception as e:
         logger.error(f"Error en /predict: {e}", exc_info=True)
         raise HTTPException(status_code=400, detail=str(e))
-
