@@ -15,7 +15,7 @@ load_dotenv()
 
 # Carga el pipeline SOLO una vez al arrancar
 # Es mejor práctica usar una variable de entorno, con un valor por defecto.
-MODEL_PATH = os.getenv("MODEL_PATH", "RF_GlucosaMujeres.joblib")
+MODEL_PATH = os.getenv("MODEL_PATH", "modelo_gradient_boosting_2.joblib")
 API_KEY = os.getenv("API_KEY")
 API_KEY_NAME = "X-API-Key"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=True)
