@@ -36,13 +36,12 @@ def to_float_or_none(v: Any) -> Optional[float]:
         return None
 
 def compute_imc(peso: Any, talla: Any) -> Optional[float]:
-    """ Calcula IMC tolerante a strings/listas; talla en m o cm. """
     p = to_float_or_none(peso)
     t = to_float_or_none(talla)
     if p is None or t is None:
         return None
     try:
-        t_m = t / 100.0 if t > 3 else t  # si parece cm, pasar a metros
+        t_m = t / 100.0 if t > 3 else t
         if t_m and t_m > 0 and p > 0:
             return round(p / (t_m ** 2), 2)
     except (TypeError, ZeroDivisionError) as e:
@@ -50,16 +49,10 @@ def compute_imc(peso: Any, talla: Any) -> Optional[float]:
     return None
 
 def sanitize_value(v: Any):
-    """
-    Convierte valores del payload a escalares seguros para pandas/sklearn.
-    - list -> primer elemento (recursivo)
-    - dict -> None (o serializa si quieres)
-    - strings 'null'/'none'/'nan'/'' -> None
-    """
     if isinstance(v, list):
         return sanitize_value(v[0]) if v else None
     if isinstance(v, dict):
-        return None  # si prefieres conservarlo: json.dumps(v)
+        return None
     if isinstance(v, str):
         s = v.strip()
         if s.lower() in {"", "null", "none", "nan"}:
@@ -68,9 +61,6 @@ def sanitize_value(v: Any):
     return v
 
 def safe_isna(v: Any) -> bool:
-    """
-    Alternativa segura a pd.isna que evita llamar isnan sobre no-numéricos.
-    """
     if v is None:
         return True
     if isinstance(v, bool):
@@ -82,25 +72,15 @@ def safe_isna(v: Any) -> bool:
     return False
 
 def align_row(payload: Dict) -> pd.DataFrame:
-    """
-    Alinea dict a FEATURE_COLS y calcula IMC si 'imc' existe en las features.
-    Sanea valores provenientes de ManyChat (listas/dicts/strings).
-    """
     global FEATURE_COLS, num_cols, cat_cols
-
-    # Saneo previo del payload
     clean = {k: sanitize_value(v) for k, v in payload.items()}
-
-    # Si no tenemos FEATURES (modelo sin metadatos), usa las claves del payload
     cols = FEATURE_COLS or list(clean.keys())
     row = {c: np.nan for c in cols}
 
-    # Copiar valores saneados que sí estén en el esquema
     for k, v in clean.items():
         if k in row:
             row[k] = v
 
-    # Calcular IMC si corresponde
     if "imc" in cols and ("peso" in clean or "talla" in clean):
         imc_val = compute_imc(clean.get("peso"), clean.get("talla"))
         if imc_val is not None:
@@ -108,12 +88,10 @@ def align_row(payload: Dict) -> pd.DataFrame:
 
     df = pd.DataFrame([row])
 
-    # Coerción numérica de columnas numéricas conocidas
     for c in num_cols:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    # Normalización de categóricas a string sin romper NaN
     for c in cat_cols:
         if c in df.columns:
             df[c] = df[c].map(lambda x: x if safe_isna(x) else str(x))
@@ -129,15 +107,18 @@ async def get_api_key(incoming_key: str = Security(api_key_header)):
 # ---- App ---------------------------------------------------------------------
 app = FastAPI(title="API Glucosa RF", version="1.0")
 
+@app.get("/")
+def root():
+    return {"ok": True, "service": "API Glucosa RF", "docs": "/docs", "health": "/health"}
+
 @app.on_event("startup")
 def load_artifacts():
-    """
-    Carga el modelo y resuelve columnas/transformers de forma tolerante.
-    """
     from sklearn.compose import ColumnTransformer
+    import sklearn, numpy as _np
 
     global pipe, num_cols, cat_cols, FEATURE_COLS
 
+    logger.info(f"VERSIONS → sklearn={sklearn.__version__} numpy={_np.__version__} pandas={pd.__version__}")
     logger.info(f"Cargando modelo desde: {MODEL_PATH}")
     try:
         pipe = joblib.load(MODEL_PATH)
@@ -145,19 +126,16 @@ def load_artifacts():
         logger.error(f"No se pudo cargar el modelo en {MODEL_PATH}: {e}", exc_info=True)
         raise
 
-    # Log de pasos disponibles
     try:
         ns = list(getattr(pipe, "named_steps", {}).keys())
         logger.info(f"named_steps: {ns}")
     except Exception:
         pass
 
-    # 1) Intentar 'preprocess' o 'preprocessor'
     pre = None
     if hasattr(pipe, "named_steps"):
         pre = pipe.named_steps.get("preprocess") or pipe.named_steps.get("preprocessor")
 
-    # 2) Buscar el primer ColumnTransformer dentro de steps
     if pre is None and hasattr(pipe, "steps"):
         for name, step in pipe.steps:
             if isinstance(step, ColumnTransformer):
@@ -165,7 +143,6 @@ def load_artifacts():
                 logger.info(f"Usando ColumnTransformer encontrado en step: {name}")
                 break
 
-    # 3) Extraer columnas si tenemos ColumnTransformer
     if pre is not None:
         try:
             ncols, ccols = [], []
@@ -188,7 +165,6 @@ def load_artifacts():
         except Exception as e:
             logger.warning(f"No se pudieron derivar columnas desde ColumnTransformer: {e}")
 
-    # 4) Fallback: usar feature_names_in_ del pipeline/modelo
     if not FEATURE_COLS:
         fallback = list(getattr(pipe, "feature_names_in_", []))
         if fallback:
@@ -211,7 +187,7 @@ class PredictItem(BaseModel):
     ips_codigo: Optional[float] = None
 
     class Config:
-        extra = "allow"  # en Pydantic v2 puedes usar: model_config = ConfigDict(extra="allow")
+        extra = "allow"
 
     @field_validator("talla")
     def talla_valida(cls, v):
@@ -233,10 +209,6 @@ def predict(item: PredictItem):
     global pipe
     try:
         df_one = align_row(item.model_dump())
-
-        # (opcional) log de tipos para depurar
-        # logger.info(df_one.dtypes.to_dict())
-
         y_pred = float(pipe.predict(df_one)[0])
         return {
             "pred_glucosa_mg_dl": round(y_pred, 2),
