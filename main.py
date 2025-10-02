@@ -8,6 +8,8 @@ import logging
 import joblib
 import numpy as np
 import pandas as pd
+from typing import Any
+import math
 
 # ---- Config / Logging --------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
@@ -184,21 +186,45 @@ def health():
         "tiene_named_steps": bool(getattr(pipe, "named_steps", {})),
     }
 
+def safe_isna(v: Any) -> bool:
+    """
+    Alternativa segura a pd.isna que evita llamar isnan sobre no-numéricos.
+    """
+    if v is None:
+        return True
+    # bool debe tratarse como escalar no-missing
+    if isinstance(v, bool):
+        return False
+    # numéricos
+    if isinstance(v, (int, float, np.floating, np.integer)):
+        # math.isnan solo admite float; protege ints
+        return isinstance(v, float) and math.isnan(v)
+    # strings: nunca los consideramos NaN (ya tratamos 'null' arriba)
+    if isinstance(v, str):
+        return False
+    # Cualquier estructura no escalar (list/dict/etc.) -> no missing
+    return False
+
 
 @app.post("/predict", dependencies=[Security(get_api_key)])
 def predict(item: PredictItem):
     global pipe
     try:
         df_one = align_row(item.model_dump())
+
+        # (opcional) log de tipos para depurar
+        # logger.info(df_one.dtypes.to_dict())
+
         y_pred = float(pipe.predict(df_one)[0])
         return {
             "pred_glucosa_mg_dl": round(y_pred, 2),
-            "imc_usado": float(df_one["imc"].iloc[0]) if "imc" in df_one.columns else None,
+            "imc_usado": float(df_one["imc"].iloc[0]) if "imc" in df_one.columns and not safe_isna(df_one["imc"].iloc[0]) else None,
             "campos_faltantes_imputados": [
                 c for c in (FEATURE_COLS or df_one.columns.tolist())
-                if (c in df_one.columns and pd.isna(df_one[c].iloc[0]))
+                if (c in df_one.columns and safe_isna(df_one[c].iloc[0]))
             ],
         }
     except Exception as e:
         logger.error(f"Error en /predict: {e}", exc_info=True)
         raise HTTPException(status_code=400, detail=str(e))
+
